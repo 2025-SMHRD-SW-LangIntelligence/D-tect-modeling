@@ -1,0 +1,81 @@
+﻿# ---- OS ----
+.DS_Store
+Thumbs.db
+
+# ---- Git ----
+.git-credentials
+
+# ---- Python / Jupyter ----
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+env/
+.env
+.env.*        # 예: .env.local
+.envrc
+*.egg-info/
+build/
+dist/
+pip-wheel-metadata/
+.ipynb_checkpoints/
+.mypy_cache/
+.pytest_cache/
+.pytype/
+.cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+htmlcov/
+
+# ---- VS Code ----
+.vscode/*
+!.vscode/extensions.json   # 팀 권장 확장만 공유하고 싶다면 남겨두기
+
+# ---- Java / Gradle (혼합 레포 대비) ----
+target/
+build/
+.gradle/
+*.class
+*.jar
+*.war
+*.ear
+
+# ---- Node (혹시 포함될 때) ----
+node_modules/
+
+# ---- Logs ----
+logs/
+*.log
+
+# ---- Data / Models (대용량 산출물) ----
+data/
+datasets/
+outputs/
+runs/
+checkpoints/
+models/
+*.pt
+*.pth
+*.bin
+*.h5
+*.onnx
+
+# ---- Credentials (민감키/토큰 파일) ----
+*.pem
+*.key
+*.p12
+*.cer
+*.crt
+*.der
+*.jks
+*secret*
+*token*
+*apikey*
+*api_key*
+*credentials*
+# GCP 서비스 계정 키 이름 패턴 자주 쓰는 것
+*service-account*.json
+*service_account*.json
+*gcp*key*.json
