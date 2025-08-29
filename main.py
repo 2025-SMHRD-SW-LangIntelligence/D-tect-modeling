@@ -9,6 +9,9 @@ from functools import lru_cache
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
+# 병렬 토크나이저 포크 경고 억제
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Query
 from PIL import Image
 
@@ -39,8 +42,8 @@ SPRING_CALLBACK_URL = os.getenv(
 # 로그 저장 루트 (기본: ./logs)
 LOG_ROOT: Path = Path(os.environ.get("DTECT_LOG_DIR", PROJECT_ROOT / "logs")).resolve()
 LOG_ROOT.mkdir(parents=True, exist_ok=True)
-CHAT_LOG_PATH: Path = LOG_ROOT / "chat_log.json"            # JSON Lines (원문 OCR 라인)
-CLASSIFIED_LOG_PATH: Path = LOG_ROOT / "classified_chats.json"  # JSON Lines (탐지된 메시지)
+CHAT_LOG_PATH: Path = LOG_ROOT / "chat_log.json"               # JSON Lines (원문 OCR 라인)
+CLASSIFIED_LOG_PATH: Path = LOG_ROOT / "classified_chats.json" # JSON Lines (탐지 메시지)
 
 # 안전모드 스위치
 DISABLE_VISION = os.getenv("DTECT_DISABLE_VISION", "0") == "1"
@@ -79,30 +82,29 @@ OPENAI_KEY_FILES = ["openai.key", "openai_api_key.txt", "openai.json"]
 @lru_cache
 def get_openai_api_key() -> Tuple[Optional[str], str]:
     """
-    OpenAI 키를 찾는 우선순위:
-    1) env OPENAI_API_KEY
-    2) env OPENAI_API_KEY_FILE 또는 DTECT_OPENAI_KEY_PATH 경로
-    3) ./credentials/openai.key | openai_api_key.txt | openai.json
-       - json이면 {"api_key": "..."} 등에서 추출
+    OpenAI 키 우선순위:
+      1) env OPENAI_API_KEY
+      2) env OPENAI_API_KEY_FILE / DTECT_OPENAI_KEY_PATH
+      3) ./credentials/openai.key | openai_api_key.txt | openai.json
+         - json이면 {"api_key": "..."} 등에서 추출
     Returns: (key or None, source_string)
     """
-    # 1) 환경변수 값
+    # 1) 환경변수
     k = os.getenv("OPENAI_API_KEY")
     if k:
         return k.strip(), "env:OPENAI_API_KEY"
 
-    # 2) 환경변수로 경로 지정
+    # 2) 환경변수 경로
     path_env = os.getenv("OPENAI_API_KEY_FILE") or os.getenv("DTECT_OPENAI_KEY_PATH")
     candidates = []
     if path_env:
         candidates.append(Path(path_env))
 
-    # 3) credentials 디렉토리 내부 기본 파일들
+    # 3) credentials 디렉토리의 기본 파일들
     cred_dir = PROJECT_ROOT / "credentials"
     for name in OPENAI_KEY_FILES:
         candidates.append(cred_dir / name)
 
-    # 후보 경로들 스캔
     for p in candidates:
         try:
             if not p or not p.exists():
@@ -116,18 +118,16 @@ def get_openai_api_key() -> Tuple[Optional[str], str]:
                         return str(v).strip(), f"file:{p.name}"
             else:
                 with p.open("r", encoding="utf-8") as f:
-                    # 첫 번째 non-empty 라인
                     for line in f:
                         s = line.strip()
                         if s:
                             return s, f"file:{p.name}"
         except Exception as e:
             log.warning("Failed reading OpenAI key file %s: %s", p, e)
-
     return None, "none"
 
 # ──────────────────────────────────────────────────────────
-# 라벨 후보 (LLM용 안내)
+# 라벨 후보 (LLM 안내)
 # ──────────────────────────────────────────────────────────
 ALLOWED = [
     "VIOLENCE", "DEFAMATION", "STALKING", "SEXUAL",
@@ -143,16 +143,46 @@ GUIDE = """
     BULLYING:  '따돌림/집단괴롭힘',
     CHANTAGE:  '협박/갈취',
     EXTORTION: '공갈/강요'
-    주어진 텍스트를 바탕으로 어떤 라벨을 가지는지 분류한다.
 """
 
 # ──────────────────────────────────────────────────────────
-# 지연 로딩
+# 지연 로딩 (UNSMILE / LLM / Vision)
 # ──────────────────────────────────────────────────────────
 @lru_cache
 def get_unsmile():
     log.info("Loading UNSMILE pipeline...")
     return pipeline("text-classification", model="smilegate-ai/kor_unsmile")
+
+def _labels_envelope_schema() -> dict:
+    """
+    OpenAI structured outputs는 루트가 반드시 object여야 함.
+    → {"items":[{label,count},...]} 형태로 감싸서 minItems=1 강제.
+    """
+    return {
+        "name": "cyberbullying_labels",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["items"],
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 5,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["label", "count"],
+                        "properties": {
+                            "label": {"type": "string", "enum": ALLOWED},
+                            "count": {"type": "integer", "minimum": 1, "maximum": 5}
+                        }
+                    }
+                }
+            }
+        }
+    }
 
 @lru_cache
 def get_llm_chain() -> Optional[ChatPromptTemplate]:
@@ -169,18 +199,24 @@ def get_llm_chain() -> Optional[ChatPromptTemplate]:
         llm = ChatOpenAI(
             model="gpt-4o",
             temperature=0.0,
-            max_tokens=500,
+            max_tokens=400,
             api_key=key,
+            model_kwargs={
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": _labels_envelope_schema()
+                }
+            }
         )
         prompt = ChatPromptTemplate.from_messages([
             ("system",
-             "다음 한국어 문장의 사이버폭력 유형을 다음 후보 중에서 정량적으로 분류하세요.\n"
-             f"후보 라벨: {', '.join(ALLOWED)}\n"
-             "JSON 배열만 출력. 각 원소는 {\"label\":\"...\",\"count\":정수} 형식이며, count>0인 라벨만 포함.\n"
-             "예: [{\"label\":\"BULLYING\",\"count\":2},{\"label\":\"DEFAMATION\",\"count\":1}]\n\n"
-             "지침:\n" + GUIDE
-             ),
-            ("human", "{text}")
+             "역할: 채팅 메시지의 사이버폭력 유형을 분류하는 분류기.\n"
+             "안내: 라벨 후보는 다음과 같음 → " + ", ".join(ALLOWED) + "\n"
+             "출력: 오직 JSON object만. 필드 items는 길이≥1의 배열이며, 각 원소는 "
+             "{{\"label\":\"<라벨>\",\"count\":<1..5>}} 이어야 함.\n"
+             "정책: 유해 표현도 분류 목적상 그대로 고려. 설명문/사과문/서론 금지. JSON 이외 금지.\n"
+            ),
+            ("human", "분석할 문장: \"{text}\"")
         ])
         log.info("LLM ready (key source: %s)", src)
         return prompt | llm
@@ -217,18 +253,70 @@ def split_user_text(line: str) -> Dict[str, str]:
     parts = line.split(' ', 1)
     return {"user": parts[0], "text": parts[1]} if len(parts) == 2 else {"user": "Unknown", "text": parts[0]}
 
+def _strip_code_fences(s: str) -> str:
+    s = s.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z0-9]*\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+    return s.strip()
+
+def _extract_first_json(s: str) -> Optional[Any]:
+    """문자열에서 첫 번째 JSON(list/object) 덩어리를 찾아 loads."""
+    s0 = _strip_code_fences(s)
+    # 1) 바로 파싱
+    try:
+        return json.loads(s0)
+    except Exception:
+        pass
+    # 2) 대괄호
+    try:
+        i = s0.find('['); j = s0.rfind(']')
+        if i != -1 and j != -1 and j > i:
+            return json.loads(s0[i:j+1])
+    except Exception:
+        pass
+    # 3) 중괄호
+    try:
+        i = s0.find('{'); j = s0.rfind('}')
+        if i != -1 and j != -1 and j > i:
+            return json.loads(s0[i:j+1])
+    except Exception:
+        pass
+    return None
+
 def parse_llm_to_list(x: Any) -> List[Dict[str, Any]]:
-    """LLM 출력(JSON/문자열/객체)을 [{label, count}, ...] 로 정규화."""
+    """
+    LLM 출력(JSON/문자열/객체)을 [{label, count}, ...] 로 정규화.
+    - 기본 기대: {"items":[{"label":"...","count":n}, ...]}
+    - 혹시 바로 list로 올 경우도 처리
+    - dict에 라벨:카운트 맵 형태도 방어
+    """
     try:
         data = x
         if hasattr(x, "content"):
             data = x.content
-        if isinstance(data, str):
-            data = json.loads(data)
 
-        out = []
+        if isinstance(data, str):
+            data = _extract_first_json(data)
+
+        out: List[Dict[str, Any]] = []
+
+        # Envelope 우선 처리
+        if isinstance(data, dict) and "items" in data and isinstance(data["items"], list):
+            for el in data["items"]:
+                if not isinstance(el, dict):
+                    continue
+                label = str(el.get("label", "")).upper().strip()
+                try:
+                    cnt = int(el.get("count", 0))
+                except Exception:
+                    cnt = 0
+                if label and cnt > 0:
+                    out.append({"label": label, "count": cnt})
+            return out
+
+        # {"BULLYING":2,...} 같은 맵 형태
         if isinstance(data, dict):
-            # {"BULLYING":2,...} 같은 형태 대비
             for k, v in data.items():
                 try:
                     cnt = int(v)
@@ -238,6 +326,7 @@ def parse_llm_to_list(x: Any) -> List[Dict[str, Any]]:
                     out.append({"label": str(k).upper().strip(), "count": cnt})
             return out
 
+        # 루트가 배열일 때
         if isinstance(data, list):
             for el in data:
                 if not isinstance(el, dict):
@@ -295,19 +384,21 @@ def ocr_lines_from_image_bytes(png_bytes: bytes, crop_ratio: float = 0.6) -> Lis
     return cleaned
 
 # ──────────────────────────────────────────────────────────
-# 핵심 분류 로직
+# 핵심 분류 로직 (LLM 전용, 휴리스틱 없음)
 # ──────────────────────────────────────────────────────────
-def classify_lines(chat_lines: List[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def classify_lines(chat_lines: List[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Returns:
-      - results: 탐지된 메시지들만 [{user,text,score,classification:[{label,count}...]}...]
+      - payload_items: 콜백/응답용(탐지된 메시지들만) [{user,text,score,classification:[{label,count}...]}...]
+      - log_detected: 로그용(탐지된 메시지) [{... , llm_reason:str}]
       - raw_log_rows: OCR 원문 로그용 [{user,text}] (전체 라인)
     """
-    out: List[Dict[str, Any]] = []
+    payload: List[Dict[str, Any]] = []
+    log_detected: List[Dict[str, Any]] = []
     raw_rows: List[Dict[str, Any]] = []
 
     if not chat_lines:
-        return out, raw_rows
+        return payload, log_detected, raw_rows
 
     clf = get_unsmile()
     chain = get_llm_chain()
@@ -328,27 +419,38 @@ def classify_lines(chat_lines: List[str]) -> Tuple[List[Dict[str, Any]], List[Di
             continue
 
         if label != "clean" and score > 0.80:
-            # LLM 분류: 여러 라벨을 모두 유지
             cls_list: List[Dict[str, Any]] = []
+            reason = None
+
             if chain is not None:
+                llm_res = None
                 try:
                     llm_res = chain.invoke({"text": text})
                     cls_list = parse_llm_to_list(llm_res)
+                    if not cls_list:
+                        reason = f"LLM 결과 비어있음/파싱불가 → 기본 라벨(BULLYING) 적용. RAW: {llm_res}"
                 except Exception as e:
-                    log.warning("LLM classify fail: %s", e)
+                    log.exception("LLM classify error. Text: '%s'", text)
+                    reason = f"LLM 예외({e.__class__.__name__}) → 기본 라벨(BULLYING) 적용"
 
-            # LLM 실패/미사용 시 최소 한 건 보장
+            # 진짜 실패(예외/빈 파싱)일 때만 안전망
             if not cls_list:
                 cls_list = [{"label": "BULLYING", "count": 1}]
 
-            out.append({
+            item = {
                 "user": st["user"],
                 "text": text,
                 "score": f"{score:.2f}",
                 "classification": cls_list
-            })
+            }
+            payload.append(item)
 
-    return out, raw_rows
+            log_item = dict(item)
+            if reason:
+                log_item["llm_reason"] = reason
+            log_detected.append(log_item)
+
+    return payload, log_detected, raw_rows
 
 def post_callback(callback_url: str, payload: List[Dict[str, Any]]) -> None:
     """탐지 건이 있을 때만 콜백 전송 (배열 형태)"""
@@ -395,34 +497,33 @@ async def predict(
     try:
         content: bytes = await file.read()
 
-        # OCR
+        # OCR → 분류
         lines = ocr_lines_from_image_bytes(content, crop_ratio=crop_ratio)
-        results, raw_rows = classify_lines(lines)
+        payload_items, log_detected, raw_rows = classify_lines(lines)
 
         # 로그 append
         append_json_lines(CHAT_LOG_PATH, raw_rows)
-        if results:
-            append_json_lines(CLASSIFIED_LOG_PATH, results)
+        append_json_lines(CLASSIFIED_LOG_PATH, log_detected)
 
-        # 콜백 URL: analId만 붙임 (백엔드 시그니처와 일치)
-        if results and analId is not None and SPRING_CALLBACK_URL:
+        # 콜백(탐지된 경우만)
+        if payload_items and analId is not None and SPRING_CALLBACK_URL:
             callback_url = f"{SPRING_CALLBACK_URL}?analId={analId}"
             if background is not None:
-                background.add_task(post_callback, callback_url, results)
+                background.add_task(post_callback, callback_url, payload_items)
             else:
-                post_callback(callback_url, results)
+                post_callback(callback_url, payload_items)
 
         # 응답(백엔드 프록시가 기대하는 형태)
         unique_labels = []
         seen = set()
-        for m in results:
+        for m in payload_items:
             for lc in (m.get("classification") or []):
                 lbl = str(lc.get("label", "")).upper().strip()
                 if lbl and lbl not in seen and lc.get("count", 0) > 0:
                     seen.add(lbl)
                     unique_labels.append(lbl)
 
-        return {"flagged": bool(results), "labels": unique_labels}
+        return {"flagged": bool(payload_items), "labels": unique_labels}
     except Exception as e:
         log.exception("predict error: %s", e)
         raise HTTPException(status_code=500, detail=f"내부 서버 오류: {e}")
