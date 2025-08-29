@@ -6,6 +6,8 @@ Thumbs.db
 .git-credentials
 
 # ---- Python / Jupyter ----
+logs/
+credentials/
 __pycache__/
 *.py[cod]
 *.so
