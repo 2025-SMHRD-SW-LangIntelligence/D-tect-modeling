@@ -1,13 +1,15 @@
+# main.py
 import os
 import io
 import json
 import re
+import time
 import logging
 from functools import lru_cache
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Query
 from PIL import Image
 
 from transformers import pipeline
@@ -17,58 +19,47 @@ from langchain_core.prompts import ChatPromptTemplate
 from google.cloud import vision
 
 # ──────────────────────────────────────────────────────────
-# 로깅 & 앱 
+# 로깅 & 앱
 # ──────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("d-tect-model")
 app = FastAPI()
 
-
 # ──────────────────────────────────────────────────────────
-# 경로/환경 기본값 (상대경로 기반)
+# 경로/환경 기본값
 # ──────────────────────────────────────────────────────────
 PROJECT_ROOT: Path = Path(__file__).parent.resolve()
 
 # 스프링 콜백 URL
-# 해당 주소는 학원 + 제 맥북 IP. 환경에 따라 수정 필요!
-SPRING_CALLBACK_URL = os.getenv("SPRING_CALLBACK_URL", "http://192.168.219.51:8081/api/analysis/callback")
+SPRING_CALLBACK_URL = os.getenv(
+    "SPRING_CALLBACK_URL",
+    "http://127.0.0.1:8081/api/analysis/callback"
+)
 
 # 로그 저장 루트 (기본: ./logs)
-# 확인이 필요하나 채팅 로그가 제대로 저장이 안되는거같음
-# 확인해볼 예정
 LOG_ROOT: Path = Path(os.environ.get("DTECT_LOG_DIR", PROJECT_ROOT / "logs")).resolve()
-DATA_DIR: Path = LOG_ROOT / "data"   # chat_log.json
-JSON_DIR: Path = LOG_ROOT / "json"   # classified_chats.json
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-JSON_DIR.mkdir(parents=True, exist_ok=True)
+LOG_ROOT.mkdir(parents=True, exist_ok=True)
+CHAT_LOG_PATH: Path = LOG_ROOT / "chat_log.json"            # JSON Lines (원문 OCR 라인)
+CLASSIFIED_LOG_PATH: Path = LOG_ROOT / "classified_chats.json"  # JSON Lines (탐지된 메시지)
 
-CHAT_LOG_PATH: Path = DATA_DIR / "chat_log.json"
-CLASSIFIED_LOG_PATH: Path = JSON_DIR / "classified_chats.json"
-
-# 안전모드 스위치 (없으면 '0')
-# 에러 검증용인데 잘 작동하는지 모르겠음
+# 안전모드 스위치
 DISABLE_VISION = os.getenv("DTECT_DISABLE_VISION", "0") == "1"
 DISABLE_LLM    = os.getenv("DTECT_DISABLE_LLM", "0") == "1"
-ENABLE_LOGS    = os.getenv("DTECT_ENABLE_LOGS", "1") == "1"  # 로그 JSON 저장 on/off
+ENABLE_LOGS    = os.getenv("DTECT_ENABLE_LOGS", "1") == "1"
 
 # ──────────────────────────────────────────────────────────
-# Google Vision 자격증명 자동 탐지 (상대경로 우선)
+# Google Vision 자격증명 자동 탐지
 # ──────────────────────────────────────────────────────────
 def _ensure_vision_credentials():
-    # 1) 이미 환경변수에 유효 경로가 있으면 그대로 사용
     env_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     if env_path and Path(env_path).exists():
         log.info("Using GOOGLE_APPLICATION_CREDENTIALS from env: %s", env_path)
         return
-
-    # 2) 사용자 지정 오버라이드 환경변수(DTECT_VISION_KEY_PATH)
     custom = os.getenv("DTECT_VISION_KEY_PATH")
     if custom and Path(custom).exists():
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = custom
         log.info("Using DTECT_VISION_KEY_PATH: %s", custom)
         return
-
-    # 3) ./credentials/*.json 중 첫번째 파일을 자동 선택
     cred_dir = PROJECT_ROOT / "credentials"
     if cred_dir.is_dir():
         json_files = sorted(cred_dir.glob("*.json"))
@@ -76,45 +67,87 @@ def _ensure_vision_credentials():
             os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(json_files[0])
             log.info("Using credentials (relative): %s", json_files[0])
             return
-
-    # 4) 없으면 비활성로 둠(안전모드로 fallback)
-    log.warning("No Vision credential found. Set GOOGLE_APPLICATION_CREDENTIALS or put a .json under ./credentials/")
+    log.warning("No Vision credential found. Put a .json under ./credentials/ or set GOOGLE_APPLICATION_CREDENTIALS")
 
 _ensure_vision_credentials()
 
 # ──────────────────────────────────────────────────────────
-# 분류 라벨/가이드
+# OpenAI API Key 파일 로드 (env → 파일 자동 탐색)
+# ──────────────────────────────────────────────────────────
+OPENAI_KEY_FILES = ["openai.key", "openai_api_key.txt", "openai.json"]
+
+@lru_cache
+def get_openai_api_key() -> Tuple[Optional[str], str]:
+    """
+    OpenAI 키를 찾는 우선순위:
+    1) env OPENAI_API_KEY
+    2) env OPENAI_API_KEY_FILE 또는 DTECT_OPENAI_KEY_PATH 경로
+    3) ./credentials/openai.key | openai_api_key.txt | openai.json
+       - json이면 {"api_key": "..."} 등에서 추출
+    Returns: (key or None, source_string)
+    """
+    # 1) 환경변수 값
+    k = os.getenv("OPENAI_API_KEY")
+    if k:
+        return k.strip(), "env:OPENAI_API_KEY"
+
+    # 2) 환경변수로 경로 지정
+    path_env = os.getenv("OPENAI_API_KEY_FILE") or os.getenv("DTECT_OPENAI_KEY_PATH")
+    candidates = []
+    if path_env:
+        candidates.append(Path(path_env))
+
+    # 3) credentials 디렉토리 내부 기본 파일들
+    cred_dir = PROJECT_ROOT / "credentials"
+    for name in OPENAI_KEY_FILES:
+        candidates.append(cred_dir / name)
+
+    # 후보 경로들 스캔
+    for p in candidates:
+        try:
+            if not p or not p.exists():
+                continue
+            if p.suffix.lower() in (".json", ".jsn"):
+                with p.open("r", encoding="utf-8") as f:
+                    data = json.load(f)
+                for field in ("api_key", "openai_api_key", "OPENAI_API_KEY", "key"):
+                    v = data.get(field)
+                    if v:
+                        return str(v).strip(), f"file:{p.name}"
+            else:
+                with p.open("r", encoding="utf-8") as f:
+                    # 첫 번째 non-empty 라인
+                    for line in f:
+                        s = line.strip()
+                        if s:
+                            return s, f"file:{p.name}"
+        except Exception as e:
+            log.warning("Failed reading OpenAI key file %s: %s", p, e)
+
+    return None, "none"
+
+# ──────────────────────────────────────────────────────────
+# 라벨 후보 (LLM용 안내)
 # ──────────────────────────────────────────────────────────
 ALLOWED = [
     "VIOLENCE", "DEFAMATION", "STALKING", "SEXUAL",
     "LEAK", "BULLYING", "CHANTAGE", "EXTORTION"
 ]
-
 GUIDE = """
 • 한 줄은 여러 라벨 동시 가능.
-• SEXUAL: 성적 의도/행위의 암시·요구·대상화 등.
-• VIOLENCE: 물리적 강제·폭력·협박·위협 등.
-• BULLYING: 집단 배제/무시/왕따·강퇴/차단 유도·비꼼 등.
-• DEFAMATION: 사실/허위사실 유포로 평판 손상.
-• LEAK: 신상·개인정보 공개·유포.
-• STALKING: 지속 추적·감시·집요한 연락.
-• CHANTAGE: 비밀을 빌미로 순응 강요.
-• EXTORTION: 폭력·협박으로 금품/이익 강요.
+    VIOLENCE:  '폭력',
+    DEFAMATION:'명예훼손',
+    STALKING:  '스토킹',
+    SEXUAL:    '성범죄',
+    LEAK:      '정보유출',
+    BULLYING:  '따돌림/집단괴롭힘',
+    CHANTAGE:  '협박/갈취',
+    EXTORTION: '공갈/강요'
+    주어진 텍스트를 바탕으로 어떤 라벨을 가지는지 분류한다.
 """
 
-JSON_SCHEMA = """[
-  {"label":"VIOLENCE","count":0},
-  {"label":"DEFAMATION","count":0},
-  {"label":"STALKING","count":0},
-  {"label":"SEXUAL","count":0},
-  {"label":"LEAK","count":0},
-  {"label":"BULLYING","count":0},
-  {"label":"CHANTAGE","count":0},
-  {"label":"EXTORTION","count":0}
-]"""
-
 # ──────────────────────────────────────────────────────────
-# 지연 로딩(서버 기동 실패 방지)
+# 지연 로딩
 # ──────────────────────────────────────────────────────────
 @lru_cache
 def get_unsmile():
@@ -126,25 +159,30 @@ def get_llm_chain() -> Optional[ChatPromptTemplate]:
     if DISABLE_LLM:
         log.warning("LLM disabled by env (DTECT_DISABLE_LLM=1).")
         return None
-    if not os.getenv("OPENAI_API_KEY"):
-        log.warning("OPENAI_API_KEY not set → LLM disabled.")
+
+    key, src = get_openai_api_key()
+    if not key:
+        log.warning("OPENAI_API_KEY not found (src=%s) → LLM disabled.", src)
         return None
+
     try:
         llm = ChatOpenAI(
             model="gpt-4o",
             temperature=0.0,
-            max_tokens=600,
-            api_key=os.getenv("OPENAI_API_KEY"),
-            model_kwargs={"response_format": {"type": "json_object"}}
+            max_tokens=500,
+            api_key=key,
         )
         prompt = ChatPromptTemplate.from_messages([
             ("system",
-             "이 시스템은 욕설로 분류된 텍스트의 사이버폭력 유형을 구분합니다.\n"
-             f"라벨 후보: {', '.join(ALLOWED)}\n"
-             "오직 JSON만 출력.\n\n응답 형식:\n" + JSON_SCHEMA
-            ),
+             "다음 한국어 문장의 사이버폭력 유형을 다음 후보 중에서 정량적으로 분류하세요.\n"
+             f"후보 라벨: {', '.join(ALLOWED)}\n"
+             "JSON 배열만 출력. 각 원소는 {\"label\":\"...\",\"count\":정수} 형식이며, count>0인 라벨만 포함.\n"
+             "예: [{\"label\":\"BULLYING\",\"count\":2},{\"label\":\"DEFAMATION\",\"count\":1}]\n\n"
+             "지침:\n" + GUIDE
+             ),
             ("human", "{text}")
         ])
+        log.info("LLM ready (key source: %s)", src)
         return prompt | llm
     except Exception as e:
         log.warning("LLM init failed: %s", e)
@@ -164,6 +202,9 @@ def get_vision_client() -> Optional[vision.ImageAnnotatorClient]:
 # ──────────────────────────────────────────────────────────
 # 유틸
 # ──────────────────────────────────────────────────────────
+def _ts() -> str:
+    return time.strftime("%Y%m%d_%H%M%S")
+
 def remove_prefix_text(text: str) -> str:
     text = re.sub(r'^(1|F|더|3|5|ㅑ|L|ㄹ|②)\s+', '', text)
     text = re.sub(r'https\s*:\s*//\s*w\s*', '', text, flags=re.IGNORECASE)
@@ -176,39 +217,64 @@ def split_user_text(line: str) -> Dict[str, str]:
     parts = line.split(' ', 1)
     return {"user": parts[0], "text": parts[1]} if len(parts) == 2 else {"user": "Unknown", "text": parts[0]}
 
-def pick_one(llm_list) -> Dict[str, Any]:
+def parse_llm_to_list(x: Any) -> List[Dict[str, Any]]:
+    """LLM 출력(JSON/문자열/객체)을 [{label, count}, ...] 로 정규화."""
     try:
-        if isinstance(llm_list, list) and llm_list:
-            pos = [d for d in llm_list if int(d.get("count", 0)) > 0]
-            chosen = max(pos, key=lambda d: int(d["count"])) if pos else llm_list[0]
-            return {"label": str(chosen["label"]), "count": int(chosen.get("count", 0))}
-        if isinstance(llm_list, dict) and "label" in llm_list:
-            return {"label": str(llm_list["label"]), "count": int(llm_list.get("count", 0))}
+        data = x
+        if hasattr(x, "content"):
+            data = x.content
+        if isinstance(data, str):
+            data = json.loads(data)
+
+        out = []
+        if isinstance(data, dict):
+            # {"BULLYING":2,...} 같은 형태 대비
+            for k, v in data.items():
+                try:
+                    cnt = int(v)
+                except Exception:
+                    continue
+                if cnt > 0:
+                    out.append({"label": str(k).upper().strip(), "count": cnt})
+            return out
+
+        if isinstance(data, list):
+            for el in data:
+                if not isinstance(el, dict):
+                    continue
+                label = str(el.get("label", "")).upper().strip()
+                try:
+                    cnt = int(el.get("count", 0))
+                except Exception:
+                    cnt = 0
+                if label and cnt > 0:
+                    out.append({"label": label, "count": cnt})
+            return out
     except Exception:
         pass
-    return {"label": "UNKNOWN", "count": 0}
+    return []
 
-def save_json(data: Any, path: Path):
-    if not ENABLE_LOGS:
+def append_json_lines(path: Path, rows: List[Dict[str, Any]]) -> None:
+    if not ENABLE_LOGS or not rows:
         return
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        with path.open("a", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False))
+                f.write("\n")
     except Exception as e:
-        log.warning("save_json failed (%s): %s", path, e)
+        log.warning("append_json_lines failed (%s): %s", path, e)
 
-def ocr_lines_from_image_bytes(png_bytes: bytes) -> List[str]:
-    """이미지 바이트 → (아래쪽 비율 크롭) → Vision OCR → 라인 리스트"""
+def ocr_lines_from_image_bytes(png_bytes: bytes, crop_ratio: float = 0.6) -> List[str]:
+    """화면 하단 crop_ratio(0~1) 지점부터 끝까지 크롭 후 OCR."""
     cli = get_vision_client()
     if cli is None:
-        # 안전모드: OCR 비활성 → 빈 라인
         return []
 
-    # 하단 40% 영역 크롭
     with Image.open(io.BytesIO(png_bytes)) as im:
         w, h = im.size
-        y_min = int(h * 0.6)
+        y_min = max(0, min(int(h * crop_ratio), h - 1))
         cropped = im.crop((0, y_min, w, h))
         buf = io.BytesIO()
         cropped.save(buf, format="PNG")
@@ -228,18 +294,27 @@ def ocr_lines_from_image_bytes(png_bytes: bytes) -> List[str]:
             cleaned.append(x)
     return cleaned
 
-def classify_lines(chat_lines: List[str]) -> List[Dict[str, Any]]:
-    """OCR 라인들 → 불링 의심만 추려 ModelMessage 리스트로 반환"""
+# ──────────────────────────────────────────────────────────
+# 핵심 분류 로직
+# ──────────────────────────────────────────────────────────
+def classify_lines(chat_lines: List[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Returns:
+      - results: 탐지된 메시지들만 [{user,text,score,classification:[{label,count}...]}...]
+      - raw_log_rows: OCR 원문 로그용 [{user,text}] (전체 라인)
+    """
     out: List[Dict[str, Any]] = []
-    clf = get_unsmile()
-    chain = get_llm_chain()  # None일 수 있음(안전모드/키 없음)
+    raw_rows: List[Dict[str, Any]] = []
 
-    # 로그용: 원시 라인 저장 (user/text 분리 형태로)
-    parsed_for_log = [split_user_text(line) for line in chat_lines]
-    save_json(parsed_for_log, CHAT_LOG_PATH)
+    if not chat_lines:
+        return out, raw_rows
+
+    clf = get_unsmile()
+    chain = get_llm_chain()
 
     for line in chat_lines:
         st = split_user_text(line)
+        raw_rows.append({"user": st["user"], "text": st["text"]})
         text = st.get("text", "")
         if not text:
             continue
@@ -253,32 +328,36 @@ def classify_lines(chat_lines: List[str]) -> List[Dict[str, Any]]:
             continue
 
         if label != "clean" and score > 0.80:
-            one = {"label": "UNKNOWN", "count": 0}
+            # LLM 분류: 여러 라벨을 모두 유지
+            cls_list: List[Dict[str, Any]] = []
             if chain is not None:
                 try:
-                    res = chain.invoke({"text": text})
-                    llm_data = json.loads(res.content)
-                    one = pick_one(llm_data)
+                    llm_res = chain.invoke({"text": text})
+                    cls_list = parse_llm_to_list(llm_res)
                 except Exception as e:
                     log.warning("LLM classify fail: %s", e)
+
+            # LLM 실패/미사용 시 최소 한 건 보장
+            if not cls_list:
+                cls_list = [{"label": "BULLYING", "count": 1}]
 
             out.append({
                 "user": st["user"],
                 "text": text,
-                "score": f"{score:.2f}",   # 문자열 점수
-                "classification": one      # 단일 객체
+                "score": f"{score:.2f}",
+                "classification": cls_list
             })
 
-    save_json(out, CLASSIFIED_LOG_PATH)
-    return out
+    return out, raw_rows
 
-def post_callback(url: str, payload: List[Dict[str, Any]]) -> None:
-    if not url:
+def post_callback(callback_url: str, payload: List[Dict[str, Any]]) -> None:
+    """탐지 건이 있을 때만 콜백 전송 (배열 형태)"""
+    if not callback_url or not payload:
         return
     try:
         import requests
-        r = requests.post(url, json=payload, timeout=(10, 30))
-        log.info("[callback] POST %s → %s", url, r.status_code)
+        r = requests.post(callback_url, json=payload, timeout=(10, 30))
+        log.info("[callback] POST %s → %s", callback_url, r.status_code)
         if r.status_code >= 400:
             log.warning("[callback body] %s", r.text[:300])
     except Exception as e:
@@ -289,31 +368,61 @@ def post_callback(url: str, payload: List[Dict[str, Any]]) -> None:
 # ──────────────────────────────────────────────────────────
 @app.get("/ping")
 def ping():
+    key, src = get_openai_api_key()
     deps = {
         "vision_enabled": get_vision_client() is not None,
-        "llm_enabled": get_llm_chain() is not None,
+        "llm_enabled": (not DISABLE_LLM) and bool(key),
+        "llm_key_source": src,
         "log_dir": str(LOG_ROOT)
     }
     return {"status": "ok", "message": "pong", "deps": deps}
 
 @app.post("/predict")
-async def predict(file: UploadFile = File(...), background: BackgroundTasks = None):
+async def predict(
+    file: UploadFile = File(...),
+    background: BackgroundTasks = None,
+    analId: Optional[int] = Query(default=None),
+    crop_ratio: float = Query(default=0.6, ge=0.0, le=1.0),
+):
     """
-    업로드된 스크린샷 1장에 대해:
-    - 하단 영역 크롭 → OCR → 라인 분리 → UNSMILE(+LLM) 분류
-    - 분류 결과 리스트 반환
-    - 동시에 SPRING_CALLBACK_URL 로 결과도 전송(백그라운드)
-    - 남아서 이야기 했듯이! sid 라는 값으로 인해 현재 콜백은 작동이 안됨
+    - 스크린샷 하단 크롭 → OCR → 라인 분리 → UNSMILE(+LLM) 분류
+    - 응답: { flagged: bool, labels: string[] }  ← 백엔드 /api/capture/frame 가 기대
+    - 콜백: 탐지(1건 이상) 시에만 /api/analysis/callback?analId=... 로 배열(JSON) 전송
+    - 모델 서버에서는 어떤 이미지도 디스크에 저장하지 않음
+    - OCR 원문은 logs/chat_log.json(JSON Lines)로 append
+    - 탐지 결과는 logs/classified_chats.json(JSON Lines)로 append
     """
     try:
-        content = await file.read()
-        lines = ocr_lines_from_image_bytes(content)
-        results = classify_lines(lines) if lines else []
+        content: bytes = await file.read()
 
-        if background is not None and SPRING_CALLBACK_URL:
-            background.add_task(post_callback, SPRING_CALLBACK_URL, results)
+        # OCR
+        lines = ocr_lines_from_image_bytes(content, crop_ratio=crop_ratio)
+        results, raw_rows = classify_lines(lines)
 
-        return results
+        # 로그 append
+        append_json_lines(CHAT_LOG_PATH, raw_rows)
+        if results:
+            append_json_lines(CLASSIFIED_LOG_PATH, results)
+
+        # 콜백 URL: analId만 붙임 (백엔드 시그니처와 일치)
+        if results and analId is not None and SPRING_CALLBACK_URL:
+            callback_url = f"{SPRING_CALLBACK_URL}?analId={analId}"
+            if background is not None:
+                background.add_task(post_callback, callback_url, results)
+            else:
+                post_callback(callback_url, results)
+
+        # 응답(백엔드 프록시가 기대하는 형태)
+        unique_labels = []
+        seen = set()
+        for m in results:
+            for lc in (m.get("classification") or []):
+                lbl = str(lc.get("label", "")).upper().strip()
+                if lbl and lbl not in seen and lc.get("count", 0) > 0:
+                    seen.add(lbl)
+                    unique_labels.append(lbl)
+
+        return {"flagged": bool(results), "labels": unique_labels}
     except Exception as e:
         log.exception("predict error: %s", e)
         raise HTTPException(status_code=500, detail=f"내부 서버 오류: {e}")
