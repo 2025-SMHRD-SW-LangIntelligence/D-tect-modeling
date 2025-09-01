@@ -1,4 +1,3 @@
-# main.py
 import os
 import io
 import json
@@ -8,6 +7,8 @@ import logging
 from functools import lru_cache
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
+from collections import deque
+import difflib
 
 # 병렬 토크나이저 포크 경고 억제
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -43,12 +44,23 @@ SPRING_CALLBACK_URL = os.getenv(
 LOG_ROOT: Path = Path(os.environ.get("DTECT_LOG_DIR", PROJECT_ROOT / "logs")).resolve()
 LOG_ROOT.mkdir(parents=True, exist_ok=True)
 CHAT_LOG_PATH: Path = LOG_ROOT / "chat_log.json"               # JSON Lines (원문 OCR 라인)
-CLASSIFIED_LOG_PATH: Path = LOG_ROOT / "classified_chats.json" # JSON Lines (탐지 메시지)
+CLASSIFIED_LOG_PATH: Path = LOG_ROOT / "classified_chats.json" # JSON Lines (탐지/억제 메시지)
 
 # 안전모드 스위치
 DISABLE_VISION = os.getenv("DTECT_DISABLE_VISION", "0") == "1"
 DISABLE_LLM    = os.getenv("DTECT_DISABLE_LLM", "0") == "1"
 ENABLE_LOGS    = os.getenv("DTECT_ENABLE_LOGS", "1") == "1"
+
+# 중복 억제 설정
+# 스크린샷에 찍힌 내용이, 캡처 주기 이유로 한번 탐지된 내용이 중복으로
+# 체크되는 경우를 방지하기 위함(지속, 반복되는건 다 탐지됩니다.)
+DEDUP_ENABLED        = os.getenv("DTECT_DEDUP_ENABLED", "1") == "1"
+DEDUP_TTL_SEC        = float(os.getenv("DTECT_DEDUP_TTL_SEC", "12"))   # 최근 12초 내 중복 억제
+DEDUP_SIM_THRESHOLD  = float(os.getenv("DTECT_DEDUP_SIM_THRESHOLD", "0.985"))  # 거의 동일 기준
+DEDUP_MAX_ENTRIES    = int(os.getenv("DTECT_DEDUP_MAX_ENTRIES", "400"))        # 세션별 메모리 상한
+
+# 세션별(analId별) 최근 탐지 텍스트 캐시: {anal_key: deque[(ts, canon_text)]}
+_RECENT_DETECTIONS: Dict[str, deque] = {}
 
 # ──────────────────────────────────────────────────────────
 # Google Vision 자격증명 자동 탐지
@@ -75,20 +87,12 @@ def _ensure_vision_credentials():
 _ensure_vision_credentials()
 
 # ──────────────────────────────────────────────────────────
-# OpenAI API Key 파일 로드 (env → 파일 자동 탐색)
+# OpenAI API Key 파일 로드
 # ──────────────────────────────────────────────────────────
 OPENAI_KEY_FILES = ["openai.key", "openai_api_key.txt", "openai.json"]
 
 @lru_cache
 def get_openai_api_key() -> Tuple[Optional[str], str]:
-    """
-    OpenAI 키 우선순위:
-      1) env OPENAI_API_KEY
-      2) env OPENAI_API_KEY_FILE / DTECT_OPENAI_KEY_PATH
-      3) ./credentials/openai.key | openai_api_key.txt | openai.json
-         - json이면 {"api_key": "..."} 등에서 추출
-    Returns: (key or None, source_string)
-    """
     # 1) 환경변수
     k = os.getenv("OPENAI_API_KEY")
     if k:
@@ -137,12 +141,10 @@ GUIDE = """
 • 한 줄은 여러 라벨 동시 가능.
     VIOLENCE:  '폭력',
     DEFAMATION:'명예훼손',
-    STALKING:  '스토킹',
     SEXUAL:    '성범죄',
-    LEAK:      '정보유출',
     BULLYING:  '따돌림/집단괴롭힘',
     CHANTAGE:  '협박/갈취',
-    EXTORTION: '공갈/강요'
+    EXTORTION: '공갈/강요''
 """
 
 # ──────────────────────────────────────────────────────────
@@ -154,10 +156,6 @@ def get_unsmile():
     return pipeline("text-classification", model="smilegate-ai/kor_unsmile")
 
 def _labels_envelope_schema() -> dict:
-    """
-    OpenAI structured outputs는 루트가 반드시 object여야 함.
-    → {"items":[{label,count},...]} 형태로 감싸서 minItems=1 강제.
-    """
     return {
         "name": "cyberbullying_labels",
         "strict": True,
@@ -261,21 +259,17 @@ def _strip_code_fences(s: str) -> str:
     return s.strip()
 
 def _extract_first_json(s: str) -> Optional[Any]:
-    """문자열에서 첫 번째 JSON(list/object) 덩어리를 찾아 loads."""
     s0 = _strip_code_fences(s)
-    # 1) 바로 파싱
     try:
         return json.loads(s0)
     except Exception:
         pass
-    # 2) 대괄호
     try:
         i = s0.find('['); j = s0.rfind(']')
         if i != -1 and j != -1 and j > i:
             return json.loads(s0[i:j+1])
     except Exception:
         pass
-    # 3) 중괄호
     try:
         i = s0.find('{'); j = s0.rfind('}')
         if i != -1 and j != -1 and j > i:
@@ -285,12 +279,6 @@ def _extract_first_json(s: str) -> Optional[Any]:
     return None
 
 def parse_llm_to_list(x: Any) -> List[Dict[str, Any]]:
-    """
-    LLM 출력(JSON/문자열/객체)을 [{label, count}, ...] 로 정규화.
-    - 기본 기대: {"items":[{"label":"...","count":n}, ...]}
-    - 혹시 바로 list로 올 경우도 처리
-    - dict에 라벨:카운트 맵 형태도 방어
-    """
     try:
         data = x
         if hasattr(x, "content"):
@@ -301,7 +289,6 @@ def parse_llm_to_list(x: Any) -> List[Dict[str, Any]]:
 
         out: List[Dict[str, Any]] = []
 
-        # Envelope 우선 처리
         if isinstance(data, dict) and "items" in data and isinstance(data["items"], list):
             for el in data["items"]:
                 if not isinstance(el, dict):
@@ -315,7 +302,6 @@ def parse_llm_to_list(x: Any) -> List[Dict[str, Any]]:
                     out.append({"label": label, "count": cnt})
             return out
 
-        # {"BULLYING":2,...} 같은 맵 형태
         if isinstance(data, dict):
             for k, v in data.items():
                 try:
@@ -326,7 +312,6 @@ def parse_llm_to_list(x: Any) -> List[Dict[str, Any]]:
                     out.append({"label": str(k).upper().strip(), "count": cnt})
             return out
 
-        # 루트가 배열일 때
         if isinstance(data, list):
             for el in data:
                 if not isinstance(el, dict):
@@ -356,7 +341,6 @@ def append_json_lines(path: Path, rows: List[Dict[str, Any]]) -> None:
         log.warning("append_json_lines failed (%s): %s", path, e)
 
 def ocr_lines_from_image_bytes(png_bytes: bytes, crop_ratio: float = 0.6) -> List[str]:
-    """화면 하단 crop_ratio(0~1) 지점부터 끝까지 크롭 후 OCR."""
     cli = get_vision_client()
     if cli is None:
         return []
@@ -384,14 +368,50 @@ def ocr_lines_from_image_bytes(png_bytes: bytes, crop_ratio: float = 0.6) -> Lis
     return cleaned
 
 # ──────────────────────────────────────────────────────────
-# 핵심 분류 로직 (LLM 전용, 휴리스틱 없음)
+# 중복 억제 유틸 (캡처 주기로 인한 중복만 차단, 지속적 가해는 허용)
 # ──────────────────────────────────────────────────────────
-def classify_lines(chat_lines: List[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+def _canon_text(s: str) -> str:
+    s = s.strip().lower()
+    s = re.sub(r'\s+', ' ', s)
+    return s
+
+def _should_suppress_duplicate(anal_key: str, text: str) -> bool:
+    """최근 DEDUP_TTL_SEC 내에 거의 동일 텍스트가 이미 탐지되었으면 True."""
+    if not DEDUP_ENABLED:
+        return False
+    now = time.time()
+    canon = _canon_text(text)
+    dq = _RECENT_DETECTIONS.setdefault(anal_key, deque())
+
+    # TTL 정리
+    ttl_cut = now - DEDUP_TTL_SEC
+    while dq and dq[0][0] < ttl_cut:
+        dq.popleft()
+
+    # 유사/동일 검사
+    for ts_i, canon_i in dq:
+        if canon == canon_i:
+            return True
+        # 거의 동일(띄어쓰기 미세, 말줄임 등)
+        if difflib.SequenceMatcher(a=canon_i, b=canon).ratio() >= DEDUP_SIM_THRESHOLD:
+            return True
+
+    # 새로 기록
+    dq.append((now, canon))
+    if len(dq) > DEDUP_MAX_ENTRIES:
+        for _ in range(len(dq) - DEDUP_MAX_ENTRIES):
+            dq.popleft()
+    return False
+
+# ──────────────────────────────────────────────────────────
+# 핵심 분류 로직 (UNSMILE + LLM)  — 페이로드 스키마 불변 유지
+# ──────────────────────────────────────────────────────────
+def classify_lines(chat_lines: List[str], anal_key: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Returns:
       - payload_items: 콜백/응답용(탐지된 메시지들만) [{user,text,score,classification:[{label,count}...]}...]
-      - log_detected: 로그용(탐지된 메시지) [{... , llm_reason:str}]
-      - raw_log_rows: OCR 원문 로그용 [{user,text}] (전체 라인)
+      - log_detected:  로그용(탐지/억제 모두) [{... , suppressed:bool?, llm_reason:str?}]
+      - raw_log_rows:  OCR 원문 로그용 [{user,text}] (전체 라인)
     """
     payload: List[Dict[str, Any]] = []
     log_detected: List[Dict[str, Any]] = []
@@ -419,9 +439,21 @@ def classify_lines(chat_lines: List[str]) -> Tuple[List[Dict[str, Any]], List[Di
             continue
 
         if label != "clean" and score > 0.80:
+            # 캡처 주기로 인한 중복 억제: 동일/거의 동일 텍스트가 재등장하면 억제
+            if _should_suppress_duplicate(anal_key, text):
+                log_detected.append({
+                    "user": st["user"],
+                    "text": text,
+                    "score": f"{score:.2f}",
+                    "classification": [{"label": "BULLYING", "count": 1}],  # 최소 라벨 (로그용)
+                    "suppressed": True,
+                    "reason": "duplicate_within_ttl"
+                })
+                continue
+
+            # ── 정상 탐지 흐름 (LLM 세부 라벨)
             cls_list: List[Dict[str, Any]] = []
             reason = None
-
             if chain is not None:
                 llm_res = None
                 try:
@@ -433,19 +465,19 @@ def classify_lines(chat_lines: List[str]) -> Tuple[List[Dict[str, Any]], List[Di
                     log.exception("LLM classify error. Text: '%s'", text)
                     reason = f"LLM 예외({e.__class__.__name__}) → 기본 라벨(BULLYING) 적용"
 
-            # 진짜 실패(예외/빈 파싱)일 때만 안전망
             if not cls_list:
                 cls_list = [{"label": "BULLYING", "count": 1}]
 
-            item = {
+            item_backend = {
                 "user": st["user"],
                 "text": text,
                 "score": f"{score:.2f}",
                 "classification": cls_list
             }
-            payload.append(item)
+            payload.append(item_backend)
 
-            log_item = dict(item)
+            # 로그는 이유까지 풍부하게
+            log_item = dict(item_backend)
             if reason:
                 log_item["llm_reason"] = reason
             log_detected.append(log_item)
@@ -453,7 +485,6 @@ def classify_lines(chat_lines: List[str]) -> Tuple[List[Dict[str, Any]], List[Di
     return payload, log_detected, raw_rows
 
 def post_callback(callback_url: str, payload: List[Dict[str, Any]]) -> None:
-    """탐지 건이 있을 때만 콜백 전송 (배열 형태)"""
     if not callback_url or not payload:
         return
     try:
@@ -475,7 +506,10 @@ def ping():
         "vision_enabled": get_vision_client() is not None,
         "llm_enabled": (not DISABLE_LLM) and bool(key),
         "llm_key_source": src,
-        "log_dir": str(LOG_ROOT)
+        "log_dir": str(LOG_ROOT),
+        "dedup_enabled": DEDUP_ENABLED,
+        "dedup_ttl_sec": DEDUP_TTL_SEC,
+        "dedup_sim_threshold": DEDUP_SIM_THRESHOLD,
     }
     return {"status": "ok", "message": "pong", "deps": deps}
 
@@ -492,20 +526,18 @@ async def predict(
     - 콜백: 탐지(1건 이상) 시에만 /api/analysis/callback?analId=... 로 배열(JSON) 전송
     - 모델 서버에서는 어떤 이미지도 디스크에 저장하지 않음
     - OCR 원문은 logs/chat_log.json(JSON Lines)로 append
-    - 탐지 결과는 logs/classified_chats.json(JSON Lines)로 append
+    - 탐지/억제 결과는 logs/classified_chats.json(JSON Lines)로 append
     """
     try:
         content: bytes = await file.read()
 
-        # OCR → 분류
         lines = ocr_lines_from_image_bytes(content, crop_ratio=crop_ratio)
-        payload_items, log_detected, raw_rows = classify_lines(lines)
+        anal_key = f"anal:{analId}" if analId is not None else "global"
+        payload_items, log_detected, raw_rows = classify_lines(lines, anal_key=anal_key)
 
-        # 로그 append
         append_json_lines(CHAT_LOG_PATH, raw_rows)
         append_json_lines(CLASSIFIED_LOG_PATH, log_detected)
 
-        # 콜백(탐지된 경우만)
         if payload_items and analId is not None and SPRING_CALLBACK_URL:
             callback_url = f"{SPRING_CALLBACK_URL}?analId={analId}"
             if background is not None:
@@ -513,7 +545,6 @@ async def predict(
             else:
                 post_callback(callback_url, payload_items)
 
-        # 응답(백엔드 프록시가 기대하는 형태)
         unique_labels = []
         seen = set()
         for m in payload_items:
