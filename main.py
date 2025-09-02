@@ -248,8 +248,26 @@ def add_space_before_question_mark(text: str) -> str:
     return re.sub(r'(\S)\?', r'\1 ?', text)
 
 def split_user_text(line: str) -> Dict[str, str]:
-    parts = line.split(' ', 1)
-    return {"user": parts[0], "text": parts[1]} if len(parts) == 2 else {"user": "Unknown", "text": parts[0]}
+    """
+    OCR로 추출된 한 줄의 텍스트에서 배지를 제거하고 user와 text로 분리합니다.
+    """
+    # 1. 정규표현식을 사용해 문장 맨 앞의 배지와 바로 뒤따르는 공백을 제거합니다.
+    #    - ^는 문장의 시작을 의미합니다.
+    #    - [\|♥•●\s]는 괄호 안의 문자 중 하나를 의미합니다.
+    #      ( | 문자는 특수기호라 앞에 \를 붙여줍니다. \s는 공백입니다.)
+    #    - +는 앞의 문자가 1번 이상 반복됨을 의미합니다.
+    badge_pattern = r'^[\|♥①②③④⑤⑥⑦⑧⑨•●★\s]+'
+    cleaned_line = re.sub(badge_pattern, '', line.strip())
+
+    # 2. 정리된 문장을 첫 번째 공백을 기준으로 user와 text로 나눕니다.
+    parts = cleaned_line.split(' ', 1)
+    
+    # 3. 분리된 결과에 따라 딕셔너리 형태로 반환합니다.
+    if len(parts) == 2:
+        return {"user": parts[0], "text": parts[1]}
+    else:
+        # 공백이 없어 분리가 안 된 경우 (사용자 이름이 없는 시스템 메시지 등)
+        return {"user": "Unknown", "text": parts[0]}
 
 def _strip_code_fences(s: str) -> str:
     s = s.strip()
@@ -340,15 +358,38 @@ def append_json_lines(path: Path, rows: List[Dict[str, Any]]) -> None:
     except Exception as e:
         log.warning("append_json_lines failed (%s): %s", path, e)
 
-def ocr_lines_from_image_bytes(png_bytes: bytes, crop_ratio: float = 0.6) -> List[str]:
+def ocr_lines_from_image_bytes(
+    png_bytes: bytes, 
+    crop_top_ratio: float = 0.15, 
+    crop_bottom_ratio: float = 0.1
+) -> List[str]:
+    """
+    이미지 바이트를 받아 상단/하단을 지정된 비율만큼 자른 후 OCR을 수행합니다.
+    - crop_top_ratio: 상단에서부터 잘라낼 세로 비율 (0.0 ~ 0.15)
+    - crop_bottom_ratio: 하단에서부터 잘라낼 세로 비율 (0.0 ~ 1.0)
+    """
     cli = get_vision_client()
     if cli is None:
         return []
 
     with Image.open(io.BytesIO(png_bytes)) as im:
         w, h = im.size
-        y_min = max(0, min(int(h * crop_ratio), h - 1))
-        cropped = im.crop((0, y_min, w, h))
+        
+        # --- 자르기(Crop) 로직 수정 ---
+        # 상단에서 잘라낼 y좌표 계산
+        y_min = int(h * crop_top_ratio)
+        # 하단에서 잘라낼 y좌표 계산 (전체 높이 - 하단 비율 높이)
+        y_max = h - int(h * crop_bottom_ratio)
+        
+        # y_min이 y_max보다 커지는 경우(비율 합이 1 이상)를 방지
+        if y_min >= y_max:
+            log.warning(f"Crop 비율의 합이 1 이상이므로 이미지를 자를 수 없습니다. (top: {crop_top_ratio}, bottom: {crop_bottom_ratio})")
+            return []
+
+        # PIL crop: (왼쪽 x, 상단 y, 오른쪽 x, 하단 y)
+        cropped = im.crop((0, y_min, w, y_max))
+        # ---------------------------
+
         buf = io.BytesIO()
         cropped.save(buf, format="PNG")
         cropped_bytes = buf.getvalue()
@@ -518,10 +559,12 @@ async def predict(
     file: UploadFile = File(...),
     background: BackgroundTasks = None,
     analId: Optional[int] = Query(default=None),
-    crop_ratio: float = Query(default=0.6, ge=0.0, le=1.0),
+    # crop_ratio를 crop_top과 crop_bottom으로 변경
+    crop_top: float = Query(default=0.15, ge=0.0, le=1.0, description="이미지 상단에서 잘라낼 비율(%)"),
+    crop_bottom: float = Query(default=0.1, ge=0.0, le=1.0, description="이미지 하단에서 잘라낼 비율(%)"),
 ):
     """
-    - 스크린샷 하단 크롭 → OCR → 라인 분리 → UNSMILE(+LLM) 분류
+    - 스크린샷 상/하단 크롭 → OCR → 라인 분리 → UNSMILE(+LLM) 분류
     - 응답: { flagged: bool, labels: string[] }  ← 백엔드 /api/capture/frame 가 기대
     - 콜백: 탐지(1건 이상) 시에만 /api/analysis/callback?analId=... 로 배열(JSON) 전송
     - 모델 서버에서는 어떤 이미지도 디스크에 저장하지 않음
@@ -531,7 +574,13 @@ async def predict(
     try:
         content: bytes = await file.read()
 
-        lines = ocr_lines_from_image_bytes(content, crop_ratio=crop_ratio)
+        # 수정된 ocr_lines_from_image_bytes 함수에 새로운 파라미터 전달
+        lines = ocr_lines_from_image_bytes(
+            content, 
+            crop_top_ratio=crop_top, 
+            crop_bottom_ratio=crop_bottom
+        )
+        
         anal_key = f"anal:{analId}" if analId is not None else "global"
         payload_items, log_detected, raw_rows = classify_lines(lines, anal_key=anal_key)
 
@@ -558,3 +607,4 @@ async def predict(
     except Exception as e:
         log.exception("predict error: %s", e)
         raise HTTPException(status_code=500, detail=f"내부 서버 오류: {e}")
+
