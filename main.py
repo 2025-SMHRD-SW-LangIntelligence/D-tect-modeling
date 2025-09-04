@@ -142,15 +142,24 @@ ALLOWED = [
     "BULLYING", "CHANTAGE", "EXTORTION"
 ]
 
-GUIDE = """
-• 한 줄은 여러 라벨 동시 가능.
-    VIOLENCE:  '폭력',
-    DEFAMATION:'명예훼손',
-    SEXUAL:    '성범죄',
-    BULLYING:  '따돌림/집단괴롭힘',
-    CHANTAGE:  '협박/갈취',
-    EXTORTION: '공갈/강요'
-"""
+
+GUIDE = {
+    "VIOLENCE": "Any statement that threatens, glorifies, or encourages physical violence or self-harm against the streamer or others. This includes not only direct threats but also veiled or hypothetical suggestions of harm.",
+
+    "DEFAMATION": "Spreading unverified information or malicious rumors with the intent to damage the streamer's credibility, reputation, or relationships. This includes baseless accusations about their gameplay, content, or personal life.",
+
+    "STALKING": "Demonstrating invasive knowledge of the streamer's offline life, private activities, or location. This is characterized by comments that create a sense of being watched or monitored, causing fear and unease.",
+
+    "SEXUAL": "Any comment that reduces the streamer to a sexual object, makes unsolicited sexual advances, or creates a sexually hostile environment. The key is whether the comment is made to respectfully appreciate or to sexually objectify.",
+
+    "LEAK": "Sharing any non-public information about the streamer or others without consent. This includes real names, contact details, private social media, or contents of private messages (doxxing).",
+
+    "BULLYING": "A pattern of hostile behavior intended to intimidate, demean, or demoralize the streamer. This is distinct from simple criticism and is characterized by its personal, often repetitive, and malicious nature, including hate speech.",
+
+    "CHANTAGE": "Blackmail. Using leverage, such as a secret or compromising information, to threaten the streamer into giving something (money, items, status) or performing an action against their will.",
+
+    "EXTORTION": "Coercion. Using direct threats of harm or disruption to force the streamer into an action. Unlike blackmail, this relies on inflicting immediate negative consequences, not revealing a secret."
+}
 
 # ──────────────────────────────────────────────────────────
 # 지연 로딩 (UNSMILE / LLM / Vision)
@@ -188,41 +197,58 @@ def _labels_envelope_schema() -> dict:
         }
     }
 
+## <<< 이 함수 전체를 복사해서 기존 함수를 덮어쓰세요 (최종 안정화 버전) >>>
 @lru_cache
 def get_llm_chain() -> Optional[ChatPromptTemplate]:
     if DISABLE_LLM:
-        log.warning("LLM disabled by env (DTECT_DISABLE_LLM=1).")
+        log.warning("LLM disabled.")
         return None
-
     key, src = get_openai_api_key()
     if not key:
         log.warning("OPENAI_API_KEY not found (src=%s) → LLM disabled.", src)
         return None
-
+    
     try:
-        llm = ChatOpenAI(
-            model="gpt-4o",
-            temperature=0.0,
-            max_tokens=400,
-            api_key=key,
-            model_kwargs={
-                "response_format": {"type": "json_schema", "json_schema": _labels_envelope_schema()}
-            }
+        llm = ChatOpenAI( model="gpt-4o", temperature=0.0, max_tokens=400, api_key=key, model_kwargs={ "response_format": { "type": "json_schema", "json_schema": _labels_envelope_schema() } } )
+        
+        # --- 안전한 동적 프롬프트 생성 시작 ---
+
+        # 1. ALLOWED 리스트를 기반으로, 프롬프트에 포함할 라벨 목록과 설명을 동적으로 생성합니다.
+        #    이렇게 하면 ALLOWED 리스트만 수정해도 프롬프트가 자동으로 업데이트됩니다.
+        active_labels_str = ", ".join(ALLOWED)
+        
+        descriptions = []
+        for label in ALLOWED:
+            # GUIDE에 해당 라벨에 대한 설명이 있을 경우에만 추가합니다.
+            if label in GUIDE:
+                description = GUIDE[label]
+                # 설명에 포함될 수 있는 모든 '{'와 '}'를 안전하게 처리하여 KeyError를 원천 방지합니다.
+                safe_description = description.replace("{", "{{").replace("}", "}}")
+                descriptions.append(f"- {label}: {safe_description}")
+        
+        label_descriptions_str = "\n".join(descriptions)
+
+        # 2. 미리 만들어둔 재료들을 조합하여 최종 시스템 프롬프트를 완성합니다.
+        system_prompt = (
+            "You are a content moderator API that only returns JSON. "
+            "Analyze the user's text for malicious cyberbullying targeting a streamer based on the definitions below. "
+            f"The available categories are: {active_labels_str}. "
+            "Consider the context of live streaming: simple frustration at a game is not bullying. The attack must be personal and malicious. "
+            "If the text is not malicious cyberbullying, you MUST return an empty JSON array for the 'items' field. "
+            "Do not include any explanation. Just return the JSON.\n\n"
+            "--- Category Definitions ---\n"
+            f"{label_descriptions_str}"
         )
-        # JSON 예시의 { } 는 템플릿 변수로 오인되지 않도록 {{ }} 로 이스케이프
+
+        # 3. 최종적으로 완성된 프롬프트를 템플릿으로 생성합니다.
         prompt = ChatPromptTemplate.from_messages([
-            ("system",
-             "역할: 채팅 메시지의 사이버폭력 유형을 분류하는 분류기.\n"
-             "라벨 후보: " + ", ".join(ALLOWED) + "\n" +
-             GUIDE + "\n"
-             "출력: 오직 JSON object만. 최상위 키는 'items'.\n"
-             "각 원소는 {{\"label\":\"<라벨>\",\"count\":<1..5>}} 형태.\n"
-             "예시: {{\"items\":[{{\"label\":\"BULLYING\",\"count\":1}}]}}\n"
-             "설명/서론/사과 금지. JSON 이외 출력 금지.\n"
-            ),
-            ("human", "분석할 문장: \"{text}\"")
+            ("system", system_prompt),
+            ("human", "{text}") # 사용자님의 안정적인 버전에 있던 {text} 변수명을 그대로 사용합니다.
         ])
-        log.info("LLM ready (key source: %s)", src)
+        
+        # --- 안전한 동적 프롬프트 생성 종료 ---
+
+        log.info("LLM ready with Final Dynamic & Stable Prompt (key source: %s)", src)
         return prompt | llm
     except Exception as e:
         log.warning("LLM init failed: %s", e)
