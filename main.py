@@ -10,6 +10,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from collections import deque
 import difflib
 
+# 병렬 토크나이저 포크 경고 억제
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Query
@@ -33,7 +34,8 @@ app = FastAPI()
 # ──────────────────────────────────────────────────────────
 PROJECT_ROOT: Path = Path(__file__).parent.resolve()
 
-# 스프링 콜백 URL (1: 모델 메시지 저장, 2: 라벨 카운트/등급 누적)
+# 스프링 콜백 URL (1 : 라벨값을 tb_case에 저장)
+#              (2 : 분석 테이블에 분석 결과 저장)
 SPRING_CALLBACK_URL = os.getenv(
     "SPRING_CALLBACK_URL",
     "http://127.0.0.1:8081/api/analysis/callback-model"
@@ -46,20 +48,21 @@ SPRING_CALLBACK_URL_2 = os.getenv(
 # 로그 저장 루트 (기본: ./logs)
 LOG_ROOT: Path = Path(os.environ.get("DTECT_LOG_DIR", PROJECT_ROOT / "logs")).resolve()
 LOG_ROOT.mkdir(parents=True, exist_ok=True)
-CHAT_LOG_PATH: Path = LOG_ROOT / "chat_log.json"
-CLASSIFIED_LOG_PATH: Path = LOG_ROOT / "classified_chats.json"
+CHAT_LOG_PATH: Path = LOG_ROOT / "chat_log.json"               # JSON Lines (원문 OCR 라인)
+CLASSIFIED_LOG_PATH: Path = LOG_ROOT / "classified_chats.json" # JSON Lines (탐지/억제 메시지)
 
 # 안전모드 스위치
 DISABLE_VISION = os.getenv("DTECT_DISABLE_VISION", "0") == "1"
 DISABLE_LLM    = os.getenv("DTECT_DISABLE_LLM", "0") == "1"
 ENABLE_LOGS    = os.getenv("DTECT_ENABLE_LOGS", "1") == "1"
 
-# 중복 억제 (캡처 주기 중복 방지)
+# 중복 억제 설정
 DEDUP_ENABLED        = os.getenv("DTECT_DEDUP_ENABLED", "1") == "1"
 DEDUP_TTL_SEC        = float(os.getenv("DTECT_DEDUP_TTL_SEC", "12"))
 DEDUP_SIM_THRESHOLD  = float(os.getenv("DTECT_DEDUP_SIM_THRESHOLD", "0.985"))
 DEDUP_MAX_ENTRIES    = int(os.getenv("DTECT_DEDUP_MAX_ENTRIES", "400"))
 
+# 세션별(analId별) 최근 탐지 텍스트 캐시: {anal_key: deque[(ts, canon_text)]}
 _RECENT_DETECTIONS: Dict[str, deque] = {}
 
 # ──────────────────────────────────────────────────────────
@@ -93,15 +96,19 @@ OPENAI_KEY_FILES = ["openai.key", "openai_api_key.txt", "openai.json"]
 
 @lru_cache
 def get_openai_api_key() -> Tuple[Optional[str], str]:
+    # 1) 환경변수
     k = os.getenv("OPENAI_API_KEY")
     if k:
         return k.strip(), "env:OPENAI_API_KEY"
 
+    # 2) 환경변수 경로
     path_env = os.getenv("OPENAI_API_KEY_FILE") or os.getenv("DTECT_OPENAI_KEY_PATH")
     candidates = []
     if path_env:
-        candidates.append(Path(path_env))
+        from pathlib import Path as _Path
+        candidates.append(_Path(path_env))
 
+    # 3) credentials 디렉토리의 기본 파일들
     cred_dir = PROJECT_ROOT / "credentials"
     for name in OPENAI_KEY_FILES:
         candidates.append(cred_dir / name)
@@ -128,14 +135,33 @@ def get_openai_api_key() -> Tuple[Optional[str], str]:
     return None, "none"
 
 # ──────────────────────────────────────────────────────────
-# 라벨 후보 (LLM 안내)
+# 라벨 후보 & 가이드
 # ──────────────────────────────────────────────────────────
 ALLOWED = [
-    "VIOLENCE", "DEFAMATION", "STALKING", "SEXUAL",
-    "LEAK", "BULLYING", "CHANTAGE", "EXTORTION"
+    "VIOLENCE", "DEFAMATION", "SEXUAL",
+    "BULLYING", "CHANTAGE", "EXTORTION"
 ]
 
+GUIDE = """
+• 한 줄은 여러 라벨 동시 가능.
+    VIOLENCE:  '폭력',
+    DEFAMATION:'명예훼손',
+    SEXUAL:    '성범죄',
+    BULLYING:  '따돌림/집단괴롭힘',
+    CHANTAGE:  '협박/갈취',
+    EXTORTION: '공갈/강요'
+"""
+
+# ──────────────────────────────────────────────────────────
+# 지연 로딩 (UNSMILE / LLM / Vision)
+# ──────────────────────────────────────────────────────────
+@lru_cache
+def get_unsmile():
+    log.info("Loading UNSMILE pipeline...")
+    return pipeline("text-classification", model="smilegate-ai/kor_unsmile")
+
 def _labels_envelope_schema() -> dict:
+    # LLM JSON 스키마 (최상위 items: [{label,count}...])
     return {
         "name": "cyberbullying_labels",
         "strict": True,
@@ -162,14 +188,6 @@ def _labels_envelope_schema() -> dict:
         }
     }
 
-# ──────────────────────────────────────────────────────────
-# 지연 로딩 (UNSMILE / LLM / Vision)
-# ──────────────────────────────────────────────────────────
-@lru_cache
-def get_unsmile():
-    log.info("Loading UNSMILE pipeline...")
-    return pipeline("text-classification", model="smilegate-ai/kor_unsmile")
-
 @lru_cache
 def get_llm_chain() -> Optional[ChatPromptTemplate]:
     if DISABLE_LLM:
@@ -188,20 +206,19 @@ def get_llm_chain() -> Optional[ChatPromptTemplate]:
             max_tokens=400,
             api_key=key,
             model_kwargs={
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": _labels_envelope_schema()
-                }
+                "response_format": {"type": "json_schema", "json_schema": _labels_envelope_schema()}
             }
         )
+        # JSON 예시의 { } 는 템플릿 변수로 오인되지 않도록 {{ }} 로 이스케이프
         prompt = ChatPromptTemplate.from_messages([
             ("system",
              "역할: 채팅 메시지의 사이버폭력 유형을 분류하는 분류기.\n"
-             "안내: 라벨 후보는 다음과 같음 → " + ", ".join(ALLOWED) + "\n"
-             "출력: 오직 JSON object만. 최상위 키는 'items'이며, 각 원소는 "
-             "객체로서 'label'(enum)과 'count'(1..5)을 가진다.\n"
-             "예시: {{\"items\": [{{\"label\": \"BULLYING\", \"count\": 1}}]}}\n"
-             "정책: 유해 표현도 분류 목적상 그대로 고려. 설명문/사과문/서론 금지. JSON 이외 금지.\n"
+             "라벨 후보: " + ", ".join(ALLOWED) + "\n" +
+             GUIDE + "\n"
+             "출력: 오직 JSON object만. 최상위 키는 'items'.\n"
+             "각 원소는 {{\"label\":\"<라벨>\",\"count\":<1..5>}} 형태.\n"
+             "예시: {{\"items\":[{{\"label\":\"BULLYING\",\"count\":1}}]}}\n"
+             "설명/서론/사과 금지. JSON 이외 출력 금지.\n"
             ),
             ("human", "분석할 문장: \"{text}\"")
         ])
@@ -225,6 +242,9 @@ def get_vision_client() -> Optional[vision.ImageAnnotatorClient]:
 # ──────────────────────────────────────────────────────────
 # 유틸
 # ──────────────────────────────────────────────────────────
+def _ts() -> str:
+    return time.strftime("%Y%m%d_%H%M%S")
+
 def remove_prefix_text(text: str) -> str:
     text = re.sub(r'^(1|F|더|3|5|ㅑ|L|ㄹ|②)\s+', '', text)
     text = re.sub(r'https\s*:\s*//\s*w\s*', '', text, flags=re.IGNORECASE)
@@ -271,10 +291,11 @@ def _extract_first_json(s: str) -> Optional[Any]:
 
 def parse_llm_to_list(x: Any) -> List[Dict[str, Any]]:
     try:
-        data = x.content if hasattr(x, "content") else x
+        data = x
+        if hasattr(x, "content"):
+            data = x.content
         if isinstance(data, str):
             data = _extract_first_json(data)
-
         out: List[Dict[str, Any]] = []
 
         if isinstance(data, dict) and "items" in data and isinstance(data["items"], list):
@@ -336,12 +357,13 @@ def ocr_lines_from_image_bytes(
     cli = get_vision_client()
     if cli is None:
         return []
+
     with Image.open(io.BytesIO(png_bytes)) as im:
         w, h = im.size
         y_min = int(h * crop_top_ratio)
         y_max = h - int(h * crop_bottom_ratio)
         if y_min >= y_max:
-            log.warning(f"Invalid crop ratios: top={crop_top_ratio}, bottom={crop_bottom_ratio}")
+            log.warning(f"Crop 비율의 합이 1 이상이므로 이미지를 자를 수 없습니다. (top: {crop_top_ratio}, bottom: {crop_bottom_ratio})")
             return []
         cropped = im.crop((0, y_min, w, y_max))
         buf = io.BytesIO()
@@ -353,6 +375,7 @@ def ocr_lines_from_image_bytes(
     texts = resp.text_annotations
     if not texts:
         return []
+
     lines = texts[0].description.split('\n')
     cleaned = []
     for line in lines:
@@ -361,6 +384,9 @@ def ocr_lines_from_image_bytes(
             cleaned.append(x)
     return cleaned
 
+# ──────────────────────────────────────────────────────────
+# 중복 억제
+# ──────────────────────────────────────────────────────────
 def _canon_text(s: str) -> str:
     s = s.strip().lower()
     s = re.sub(r'\s+', ' ', s)
@@ -372,20 +398,26 @@ def _should_suppress_duplicate(anal_key: str, text: str) -> bool:
     now = time.time()
     canon = _canon_text(text)
     dq = _RECENT_DETECTIONS.setdefault(anal_key, deque())
+
     ttl_cut = now - DEDUP_TTL_SEC
     while dq and dq[0][0] < ttl_cut:
         dq.popleft()
+
     for _, canon_i in dq:
         if canon == canon_i:
             return True
         if difflib.SequenceMatcher(a=canon_i, b=canon).ratio() >= DEDUP_SIM_THRESHOLD:
             return True
+
     dq.append((now, canon))
     if len(dq) > DEDUP_MAX_ENTRIES:
         for _ in range(len(dq) - DEDUP_MAX_ENTRIES):
             dq.popleft()
     return False
 
+# ──────────────────────────────────────────────────────────
+# 핵심 분류 로직 (UNSMILE + LLM)
+# ──────────────────────────────────────────────────────────
 def classify_lines(chat_lines: List[str], anal_key: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     payload: List[Dict[str, Any]] = []
     log_detected: List[Dict[str, Any]] = []
@@ -427,14 +459,15 @@ def classify_lines(chat_lines: List[str], anal_key: str) -> Tuple[List[Dict[str,
             cls_list: List[Dict[str, Any]] = []
             reason = None
             if chain is not None:
+                llm_res = None
                 try:
                     llm_res = chain.invoke({"text": text})
                     cls_list = parse_llm_to_list(llm_res)
                     if not cls_list:
-                        reason = f"LLM empty/unparseable → default BULLYING"
+                        reason = f"LLM 결과 비어있음/파싱불가 → 기본 라벨(BULLYING) 적용. RAW: {llm_res}"
                 except Exception as e:
                     log.exception("LLM classify error. Text: '%s'", text)
-                    reason = f"LLM exception({e.__class__.__name__}) → default BULLYING"
+                    reason = f"LLM 예외({e.__class__.__name__}) → 기본 라벨(BULLYING) 적용"
 
             if not cls_list:
                 cls_list = [{"label": "BULLYING", "count": 1}]
@@ -454,6 +487,9 @@ def classify_lines(chat_lines: List[str], anal_key: str) -> Tuple[List[Dict[str,
 
     return payload, log_detected, raw_rows
 
+# ──────────────────────────────────────────────────────────
+# 콜백 호출
+# ──────────────────────────────────────────────────────────
 def post_callback(callback_url: str, payload: List[Dict[str, Any]]) -> None:
     if not callback_url or not payload:
         return
@@ -466,17 +502,19 @@ def post_callback(callback_url: str, payload: List[Dict[str, Any]]) -> None:
     except Exception as e:
         log.warning("callback error: %s", e)
 
-def post_callbacks(urls: List[str], anal_id: Optional[int], payload: List[Dict[str, Any]], background: Optional[BackgroundTasks] = None):
+def post_callbacks(anal_id: Optional[int], payload: List[Dict[str, Any]], background: Optional[BackgroundTasks]) -> None:
     if not payload or anal_id is None:
         return
-    for base in urls:
-        if not base:
-            continue
-        url = f"{base.rstrip('/')}?analId={anal_id}"
+    urls = []
+    if SPRING_CALLBACK_URL:
+        urls.append(f"{SPRING_CALLBACK_URL}?analId={anal_id}")
+    if SPRING_CALLBACK_URL_2:
+        urls.append(f"{SPRING_CALLBACK_URL_2}?analId={anal_id}")
+    for u in urls:
         if background is not None:
-            background.add_task(post_callback, url, payload)
+            background.add_task(post_callback, u, payload)
         else:
-            post_callback(url, payload)
+            post_callback(u, payload)
 
 # ──────────────────────────────────────────────────────────
 # 엔드포인트
@@ -500,16 +538,17 @@ async def predict(
     file: UploadFile = File(...),
     background: BackgroundTasks = None,
     analId: Optional[int] = Query(default=None),
-    crop_top: float = Query(default=0.15, ge=0.0, le=1.0),
-    crop_bottom: float = Query(default=0.1, ge=0.0, le=1.0),
+    crop_top: float = Query(default=0.15, ge=0.0, le=1.0, description="이미지 상단에서 잘라낼 비율(%)"),
+    crop_bottom: float = Query(default=0.1, ge=0.0, le=1.0, description="이미지 하단에서 잘라낼 비율(%)"),
 ):
     """
-    - 이미지 크롭 → OCR → UNSMILE(+LLM) → 탐지된 라인 payload 생성
-    - 콜백: 탐지시 /callback-model, /callback 두 군데로 동시에 전송(analId 필요)
+    - 스크린샷 상/하단 크롭 → OCR → 라인 분리 → UNSMILE(+LLM) 분류
     - 응답: { flagged: bool, labels: string[] }
+    - 콜백: 탐지(1건 이상) 시 /api/analysis/callback-model & /api/analysis/callback 둘 다 전송
     """
     try:
         content: bytes = await file.read()
+
         lines = ocr_lines_from_image_bytes(
             content,
             crop_top_ratio=crop_top,
@@ -519,19 +558,12 @@ async def predict(
         anal_key = f"anal:{analId}" if analId is not None else "global"
         payload_items, log_detected, raw_rows = classify_lines(lines, anal_key=anal_key)
 
-        append_json_lines(CHAT_LOG_PATH, raw_rows)
+        append_json_lines(CHAT_LOG_PATH, [{"user": r["user"], "text": r["text"]} for r in raw_rows])
         append_json_lines(CLASSIFIED_LOG_PATH, log_detected)
 
-        # === 두 콜백으로 동시 전송 ===
         if payload_items and analId is not None:
-            post_callbacks(
-                [SPRING_CALLBACK_URL, SPRING_CALLBACK_URL_2],
-                analId,
-                payload_items,
-                background
-            )
+            post_callbacks(analId, payload_items, background)
 
-        # 응답 요약 라벨
         unique_labels = []
         seen = set()
         for m in payload_items:
