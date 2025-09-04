@@ -36,7 +36,7 @@ PROJECT_ROOT: Path = Path(__file__).parent.resolve()
 # 스프링 콜백 URL (1: 모델 메시지 저장, 2: 라벨 카운트/등급 누적)
 SPRING_CALLBACK_URL = os.getenv(
     "SPRING_CALLBACK_URL",
-    "http://127.0.0.1:8081/api/analysis/callback-model"  # 필요시 8080으로 변경
+    "http://127.0.0.1:8081/api/analysis/callback-model"
 )
 SPRING_CALLBACK_URL_2 = os.getenv(
     "SPRING_CALLBACK_URL_2",
