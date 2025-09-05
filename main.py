@@ -148,11 +148,7 @@ GUIDE = {
 
     "DEFAMATION": "Spreading unverified information or malicious rumors with the intent to damage the streamer's credibility, reputation, or relationships. This includes baseless accusations about their gameplay, content, or personal life.",
 
-    "STALKING": "Demonstrating invasive knowledge of the streamer's offline life, private activities, or location. This is characterized by comments that create a sense of being watched or monitored, causing fear and unease.",
-
     "SEXUAL": "Any comment that reduces the streamer to a sexual object, makes unsolicited sexual advances, or creates a sexually hostile environment. The key is whether the comment is made to respectfully appreciate or to sexually objectify.",
-
-    "LEAK": "Sharing any non-public information about the streamer or others without consent. This includes real names, contact details, private social media, or contents of private messages (doxxing).",
 
     "BULLYING": "A pattern of hostile behavior intended to intimidate, demean, or demoralize the streamer. This is distinct from simple criticism and is characterized by its personal, often repetitive, and malicious nature, including hate speech.",
 
